@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Mirrors NVD's JSON 2.0 feeds from nvd.nist.gov to an S3 bucket.
+#
+# Usage: sync-nvd
+#
+# Environment:
+#   NVD_MIRROR_BUCKET      bucket to upload to
+#   NVD_MIRROR_ENDPOINT    S3 endpoint, e.g. https://fsn1.your-objectstorage.com
+#   AWS_DEFAULT_REGION     S3 region, e.g. fsn1
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   NVD_FEEDS              feeds to mirror (default: the last six years and
+#                          "modified", the feeds vulnix reads)
+#
+# A feed is only downloaded if its .meta file at NVD differs from the one in
+# the bucket. Downloads resume until complete, because NVD drops connections
+# in the middle of large files. Each feed is checked against the size and
+# SHA256 in its .meta file, and the .meta file is uploaded after the feed, so
+# a .meta file in the bucket always describes a complete feed.
+set -euo pipefail
+
+: "${NVD_MIRROR_BUCKET:?}" "${NVD_MIRROR_ENDPOINT:?}" "${AWS_DEFAULT_REGION:?}"
+
+source=https://nvd.nist.gov/feeds/json/cve/2.0
+year=$(date -u +%Y)
+feeds=${NVD_FEEDS:-"$(seq $((year - 5)) "$year" | tr '\n' ' ')modified"}
+
+# AWS CLI v2 adds checksums by default that not every S3-compatible service
+# accepts.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+s3() {
+  aws --endpoint-url "$NVD_MIRROR_ENDPOINT" s3 "$@"
+}
+
+file_size() {
+  if [ -f "$1" ]; then wc -c < "$1"; else echo 0; fi
+}
+
+# .meta files consist of "key:value" lines ending in CRLF.
+meta_field() {
+  tr -d '\r' < "$1" | sed -n "s/^$2://p"
+}
+
+sync_feed() {
+  local feed=$1
+  local name=nvdcve-2.0-$feed
+  local meta=$work/$name.meta
+  local gz=$work/$name.json.gz
+
+  curl -fsS --retry 5 --retry-all-errors --max-time 120 -o "$meta" "$source/$name.meta"
+  local size sha
+  size=$(meta_field "$meta" gzSize)
+  sha=$(meta_field "$meta" sha256 | tr '[:upper:]' '[:lower:]')
+
+  if s3 cp --quiet "s3://$NVD_MIRROR_BUCKET/$name.meta" "$meta.mirrored" 2>/dev/null \
+    && [ "$(meta_field "$meta.mirrored" sha256 | tr '[:upper:]' '[:lower:]')" = "$sha" ]; then
+    echo "$feed: unchanged"
+    return 0
+  fi
+
+  local attempt
+  for attempt in $(seq 1 60); do
+    if [ "$(file_size "$gz")" -eq "$size" ]; then
+      break
+    fi
+    curl -fsS -C - --max-time 900 -o "$gz" "$source/$name.json.gz" || true
+  done
+
+  if [ "$(file_size "$gz")" -ne "$size" ]; then
+    echo "$feed: incomplete after $attempt attempts" >&2
+    return 1
+  fi
+  if [ "$(gzip -dc "$gz" | sha256sum | cut -d' ' -f1)" != "$sha" ]; then
+    echo "$feed: SHA256 does not match the .meta file" >&2
+    return 1
+  fi
+
+  s3 cp --quiet --content-type application/gzip "$gz" "s3://$NVD_MIRROR_BUCKET/$name.json.gz"
+  s3 cp --quiet --content-type text/plain "$meta" "s3://$NVD_MIRROR_BUCKET/$name.meta"
+  echo "$feed: updated ($attempt download attempts)"
+}
+
+pids=()
+for feed in $feeds; do
+  sync_feed "$feed" &
+  pids+=("$!")
+done
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+exit "$status"

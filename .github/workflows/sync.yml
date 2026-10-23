@@ -1,0 +1,29 @@
+name: Sync NVD feeds
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # NVD currently delivers about 30-60 KB/s per connection.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./sync-nvd
+        env:
+          NVD_MIRROR_BUCKET: nvd-mirror
+          NVD_MIRROR_ENDPOINT: https://fsn1.your-objectstorage.com
+          AWS_DEFAULT_REGION: fsn1
+          AWS_ACCESS_KEY_ID: ${{ secrets.NVD_MIRROR_BUCKET_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NVD_MIRROR_BUCKET_SECRET_ACCESS_KEY }}
