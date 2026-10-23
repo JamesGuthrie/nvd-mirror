@@ -5,11 +5,12 @@
 #
 # Environment:
 #   NVD_MIRROR_BUCKET      bucket to upload to
-#   NVD_MIRROR_ENDPOINT    S3 endpoint, e.g. https://fsn1.your-objectstorage.com
-#   AWS_DEFAULT_REGION     S3 region, e.g. fsn1
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 #   NVD_FEEDS              feeds to mirror (default: the last six years and
 #                          "modified", the feeds vulnix reads)
+#
+# The AWS CLI takes the S3 endpoint, region and credentials from its usual
+# settings, e.g. AWS_ENDPOINT_URL_S3, AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY.
 #
 # A feed is only downloaded if its .meta file at NVD differs from the one in
 # the bucket. Downloads resume until complete, because NVD drops connections
@@ -18,11 +19,16 @@
 # a .meta file in the bucket always describes a complete feed.
 set -euo pipefail
 
-: "${NVD_MIRROR_BUCKET:?}" "${NVD_MIRROR_ENDPOINT:?}" "${AWS_DEFAULT_REGION:?}"
+: "${NVD_MIRROR_BUCKET:?}"
 
 source=https://nvd.nist.gov/feeds/json/cve/2.0
 year=$(date -u +%Y)
 feeds=${NVD_FEEDS:-"$(seq $((year - 5)) "$year" | tr '\n' ' ')modified"}
+
+# Consecutive failed download attempts per feed before giving up. After the
+# n-th failure, the next attempt waits n minutes, so a feed gets 45 minutes to
+# become available again.
+max_failures=10
 
 # AWS CLI v2 adds checksums by default that not every S3-compatible service
 # accepts.
@@ -32,12 +38,17 @@ export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-s3() {
-  aws --endpoint-url "$NVD_MIRROR_ENDPOINT" s3 "$@"
-}
-
 file_size() {
   if [ -f "$1" ]; then wc -c < "$1"; else echo 0; fi
+}
+
+megabytes() {
+  awk -v bytes="$1" 'BEGIN { printf "%.1f MB", bytes / 1048576 }'
+}
+
+# Prefixes messages with the feed, as feeds are synced in parallel.
+log() {
+  echo "$feed: $*"
 }
 
 # .meta files consist of "key:value" lines ending in CRLF.
@@ -45,52 +56,86 @@ meta_field() {
   tr -d '\r' < "$1" | sed -n "s/^$2://p"
 }
 
+# Downloads $source/$1 to $2, resuming after interrupted transfers, until it
+# has $3 bytes.
+download() {
+  local url=$source/$1 file=$2 size=$3
+  local failures=0 error before
+  while [ "$(file_size "$file")" -lt "$size" ]; do
+    before=$(file_size "$file")
+    if error=$(curl -fsS -C - --max-time 900 -o "$file" "$url" 2>&1); then
+      continue
+    fi
+    # An interrupted transfer that made progress is not a failure.
+    if [ "$(file_size "$file")" -gt "$before" ]; then
+      failures=0
+      log "transfer interrupted at $(megabytes "$(file_size "$file")") of $(megabytes "$size") ($error); resuming"
+      continue
+    fi
+    failures=$((failures + 1))
+    if [ "$failures" -ge "$max_failures" ]; then
+      log "giving up on $1 after $failures failed attempts ($error)" >&2
+      return 1
+    fi
+    log "downloading $1 failed ($error); waiting $failures min before attempt $((failures + 1)) of $max_failures"
+    sleep $((failures * 60))
+  done
+  if [ "$(file_size "$file")" -gt "$size" ]; then
+    log "$1 is larger than its .meta file says; NVD probably regenerated it during the download" >&2
+    return 1
+  fi
+}
+
 sync_feed() {
   local feed=$1
   local name=nvdcve-2.0-$feed
   local meta=$work/$name.meta
   local gz=$work/$name.json.gz
+  local started=$SECONDS
 
   curl -fsS --retry 5 --retry-all-errors --max-time 120 -o "$meta" "$source/$name.meta"
-  local size sha
+  local size sha modified
   size=$(meta_field "$meta" gzSize)
   sha=$(meta_field "$meta" sha256 | tr '[:upper:]' '[:lower:]')
+  modified=$(meta_field "$meta" lastModifiedDate)
 
-  if s3 cp --quiet "s3://$NVD_MIRROR_BUCKET/$name.meta" "$meta.mirrored" 2>/dev/null \
+  if aws s3 cp --quiet "s3://$NVD_MIRROR_BUCKET/$name.meta" "$meta.mirrored" 2>/dev/null \
     && [ "$(meta_field "$meta.mirrored" sha256 | tr '[:upper:]' '[:lower:]')" = "$sha" ]; then
-    echo "$feed: unchanged"
+    log "unchanged (NVD's version from $modified)"
+    echo unchanged > "$work/$feed.outcome"
     return 0
   fi
 
-  local attempt
-  for attempt in $(seq 1 60); do
-    if [ "$(file_size "$gz")" -eq "$size" ]; then
-      break
-    fi
-    curl -fsS -C - --max-time 900 -o "$gz" "$source/$name.json.gz" || true
-  done
-
-  if [ "$(file_size "$gz")" -ne "$size" ]; then
-    echo "$feed: incomplete after $attempt attempts" >&2
-    return 1
-  fi
+  log "NVD has a new version from $modified; downloading $name.json.gz ($(megabytes "$size"))"
+  download "$name.json.gz" "$gz" "$size"
   if [ "$(gzip -dc "$gz" | sha256sum | cut -d' ' -f1)" != "$sha" ]; then
-    echo "$feed: SHA256 does not match the .meta file" >&2
+    log "$name.json.gz does not match the SHA256 in its .meta file" >&2
     return 1
   fi
 
-  s3 cp --quiet --content-type application/gzip "$gz" "s3://$NVD_MIRROR_BUCKET/$name.json.gz"
-  s3 cp --quiet --content-type text/plain "$meta" "s3://$NVD_MIRROR_BUCKET/$name.meta"
-  echo "$feed: updated ($attempt download attempts)"
+  log "downloaded in $((SECONDS - started)) s and verified; uploading to s3://$NVD_MIRROR_BUCKET"
+  aws s3 cp --quiet --content-type application/gzip "$gz" "s3://$NVD_MIRROR_BUCKET/$name.json.gz"
+  aws s3 cp --quiet --content-type text/plain "$meta" "s3://$NVD_MIRROR_BUCKET/$name.meta"
+  log "uploaded"
+  echo updated > "$work/$feed.outcome"
 }
 
-pids=()
+echo "Syncing feeds $feeds from $source to s3://$NVD_MIRROR_BUCKET"
+declare -A pids
 for feed in $feeds; do
   sync_feed "$feed" &
-  pids+=("$!")
+  pids[$feed]=$!
 done
-status=0
-for pid in "${pids[@]}"; do
-  wait "$pid" || status=1
+updated=() unchanged=() failed=()
+for feed in $feeds; do
+  if wait "${pids[$feed]}"; then
+    case $(cat "$work/$feed.outcome") in
+      updated) updated+=("$feed") ;;
+      unchanged) unchanged+=("$feed") ;;
+    esac
+  else
+    failed+=("$feed")
+  fi
 done
-exit "$status"
+echo "Updated: ${updated[*]:-none}; unchanged: ${unchanged[*]:-none}; failed: ${failed[*]:-none}"
+[ "${#failed[@]}" -eq 0 ]

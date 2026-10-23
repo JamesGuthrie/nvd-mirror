@@ -23,7 +23,7 @@ jobs:
       - run: ./sync-nvd
         env:
           NVD_MIRROR_BUCKET: nvd-mirror
-          NVD_MIRROR_ENDPOINT: https://fsn1.your-objectstorage.com
+          AWS_ENDPOINT_URL_S3: https://fsn1.your-objectstorage.com
           AWS_DEFAULT_REGION: fsn1
           AWS_ACCESS_KEY_ID: ${{ secrets.NVD_MIRROR_BUCKET_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.NVD_MIRROR_BUCKET_SECRET_ACCESS_KEY }}

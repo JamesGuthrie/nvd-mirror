@@ -45,6 +45,13 @@ The bucket is `nvd-mirror`, a public Hetzner Object Storage bucket in
 | `NVD_MIRROR_BUCKET_ACCESS_KEY_ID`     | S3 access key with write access to the bucket |
 | `NVD_MIRROR_BUCKET_SECRET_ACCESS_KEY` | its secret key                                |
 
-`sync-nvd` also runs locally, with the settings from the workflow as
-environment variables and the keys as `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY`.
+`sync-nvd` also runs locally. It needs `NVD_MIRROR_BUCKET`; the AWS CLI takes
+the endpoint, region and keys from its usual settings, e.g.:
+
+```sh
+NVD_MIRROR_BUCKET=nvd-mirror \
+AWS_ENDPOINT_URL_S3=https://fsn1.your-objectstorage.com \
+AWS_DEFAULT_REGION=fsn1 \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+./sync-nvd
+```
